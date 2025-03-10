@@ -1,14 +1,26 @@
 import asyncio
 import json
-import warnings
 import uuid
+import warnings
 from collections import defaultdict
-from typing import Dict, Any, Optional, List, Type, TYPE_CHECKING, Set, Tuple, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    DefaultDict,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Type,
+    TypeVar,
+)
 
 from .context_serializers import BaseSerializer, JsonSerializer
 from .decorators import StepConfig
-from .events import Event
 from .errors import WorkflowRuntimeError
+from .events import Event
+from .types import RunResultT
 
 if TYPE_CHECKING:  # pragma: no cover
     from .workflow import Workflow
@@ -52,15 +64,23 @@ class Context:
             lock=self._step_lock
         )
         self._accepted_events: List[Tuple[str, str]] = []
-        self._retval: Any = None
+        self._retval: RunResultT = None
+
+        # Map the step names that were executed to a list of events they received.
+        # This will be serialized, and is needed to resume a Workflow run passing
+        # an existing context.
         self._in_progress: Dict[str, List[Event]] = defaultdict(list)
+        # Keep track of the steps currently running. This is only valid when a
+        # workflow is running and won't be serialized. Note that a single step
+        # might have multiple workers, so we keep a counter.
+        self._currently_running_steps: DefaultDict[str, int] = defaultdict(int)
         # Streaming machinery
         self._streaming_queue: asyncio.Queue = asyncio.Queue()
         # Global data storage
         self._lock = asyncio.Lock()
         self._globals: Dict[str, Any] = {}
         # Step-specific instance
-        self._events_buffer: Dict[Type[Event], List[Event]] = defaultdict(list)
+        self._events_buffer: Dict[str, List[Event]] = defaultdict(list)
 
     def _serialize_queue(self, queue: asyncio.Queue, serializer: BaseSerializer) -> str:
         queue_items = list(queue._queue)  # type: ignore
@@ -199,6 +219,20 @@ class Context:
             events = [e for e in self._in_progress[name] if e != ev]
             self._in_progress[name] = events
 
+    async def add_running_step(self, name: str) -> None:
+        async with self.lock:
+            self._currently_running_steps[name] += 1
+
+    async def remove_running_step(self, name: str) -> None:
+        async with self.lock:
+            self._currently_running_steps[name] -= 1
+            if self._currently_running_steps[name] == 0:
+                del self._currently_running_steps[name]
+
+    async def running_steps(self) -> List[str]:
+        async with self.lock:
+            return list(self._currently_running_steps)
+
     async def get(self, key: str, default: Optional[Any] = Ellipsis) -> Any:
         """Get the value corresponding to `key` from the Context.
 
@@ -225,7 +259,7 @@ class Context:
         Use `get` and `set` instead.
         """
         msg = "`data` is deprecated, please use the `get` and `set` method to store data into the Context."
-        warnings.warn(msg, DeprecationWarning)
+        warnings.warn(msg, DeprecationWarning, stacklevel=2)
         return self._globals
 
     @property
@@ -237,17 +271,20 @@ class Context:
     def session(self) -> "Context":
         """This property is provided for backward compatibility."""
         msg = "`session` is deprecated, please use the Context instance directly."
-        warnings.warn(msg, DeprecationWarning)
+        warnings.warn(msg, DeprecationWarning, stacklevel=2)
         return self
+
+    def _get_full_path(self, ev_type: Type[Event]) -> str:
+        return f"{ev_type.__module__}.{ev_type.__name__}"
 
     def collect_events(
         self, ev: Event, expected: List[Type[Event]]
     ) -> Optional[List[Event]]:
-        self._events_buffer[type(ev)].append(ev)
+        self._events_buffer[self._get_full_path(type(ev))].append(ev)
 
         retval: List[Event] = []
         for e_type in expected:
-            e_instance_list = self._events_buffer.get(e_type)
+            e_instance_list = self._events_buffer.get(self._get_full_path(e_type))
             if e_instance_list:
                 retval.append(e_instance_list.pop(0))
 
@@ -256,7 +293,7 @@ class Context:
 
         # put back the events if unable to collect all
         for ev in retval:
-            self._events_buffer[type(ev)].append(ev)
+            self._events_buffer[self._get_full_path(type(ev))].append(ev)
 
         return None
 
@@ -312,7 +349,7 @@ class Context:
             event = await asyncio.wait_for(
                 self._queues[self._waiter_id].get(), timeout=timeout
             )
-            if type(event) == event_type:
+            if type(event) is event_type:
                 if all(
                     event.get(k, default=None) == v for k, v in requirements.items()
                 ):
@@ -323,7 +360,7 @@ class Context:
     def write_event_to_stream(self, ev: Optional[Event]) -> None:
         self._streaming_queue.put_nowait(ev)
 
-    def get_result(self) -> Any:
+    def get_result(self) -> RunResultT:
         """Returns the result of the workflow."""
         return self._retval
 
